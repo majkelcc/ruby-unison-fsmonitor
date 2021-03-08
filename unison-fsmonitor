@@ -2,9 +2,6 @@
 
 require 'rb-fsevent'
 
-# Don't buffer the output
-STDOUT.sync = true
-
 # Print some debug info to the STDERR
 $debug = false
 
@@ -64,6 +61,7 @@ module UnisonMonitor
 
   def report_recursive(hash)
     (@changes.delete(hash) || []).each { |path| sendRecursive(path) }
+    STDOUT.flush
   end
 
 end
@@ -107,31 +105,32 @@ rescue EOFError
   nil
 end
 
+def sendCmd(command)
+  debug "<- #{command}"
+  STDOUT.puts command
+  STDOUT.flush
+end
+
 def sendOk
-  debug "<- OK"
-  puts "OK"
+  sendCmd "OK"
 end
 
 def sendRecursive(path)
-  debug "<- RECURSIVE #{path}"
-  puts "RECURSIVE #{path}"
+  sendCmd "RECURSIVE #{path}"
 end
 
 def sendChanges(hash)
-  debug "<- CHANGES #{hash}"
-  puts "CHANGES #{hash}"
+  sendCmd "CHANGES #{hash}"
 end
 
 def sendDone
-  debug "<- DONE"
-  puts "DONE"
+  sendCmd "DONE"
 end
 
 # At any time, the child process can signal an error by sending an
 # "ERROR msg" message.
 def sendError(msg)
-  debug "<- ERROR #{msg}"
-  puts "ERROR #{msg}"
+  sendCmd "ERROR #{msg}"
 end
 
 def unknownCommandError(command)
@@ -140,108 +139,113 @@ def unknownCommandError(command)
 end
 
 def sendVersion(version_no)
-  debug "<- VERSION #{version_no}"
-  puts "VERSION #{version_no}"
+  sendCmd "VERSION #{version_no}"
 end
 
 def debug(msg)
-  STDERR.puts(msg) if $debug
+  return unless $debug
+  STDERR.puts(msg)
+  STDERR.flush
 end
 
-while cmd = readline do
-  if cmd !~ /^WAIT/
-    UnisonMonitor.pause!
-  end
-
-  case cmd
-  when /^VERSION ([0-9])/
-    # Unison and the child process starts by indicating the protocol
-    # version they support. At the moment, they should just output the
-    # line 'VERSION 1'.
-    if $1 == "#{UNISON_FSMONITOR_VERSION_NO}"
-      sendVersion(UNISON_FSMONITOR_VERSION_NO)
-    else
-      sendError "Unknown version: #{cmd}"
+begin
+  while cmd = readline do
+    if cmd !~ /^WAIT/
+      UnisonMonitor.pause!
     end
 
-  when /^START ([^\s]+) ([^\s]+) ?([^\s]*)/ # 'START hash fspath [path]'
-    # When Unison start scanning a part of the replica, it emits command:
-    # 'START hash fspath path', thus indicating the archive hash (that
-    # uniquely determines the replica) the replica's fspath and the path
-    # where the scanning process starts. The child process should start
-    # monitoring this location, then acknowledge the command by sending an
-    # 'OK' response.
-    hash = $1
-    fspath = $2
-    path = $3
-    UnisonMonitor.start(hash, fspath, path)
-    sendOk
-
-    while cmd = readline do
-      case cmd
-      when /^DIR/ # 'DIR [path1]'
-        # When Unison starts scanning a directory, it emits the command
-        # 'DIR path1', where 'path1' is relative to the path given by the
-        # START command (the location of the directory can be obtained by
-        # concatenation of 'fspath', 'path', and 'path1'). The child process
-        # should then start monitoring the directory, before sending an 'OK'
-        # response.
-        sendOk
-
-      when /^LINK (.+)/ # 'LINK path1'
-        # When Unison encounters a followed link, it emits the command
-        # 'LINK path1'. The child process is expected to start monitoring
-        # the link target before replying by 'OK'.
-        sendError("link following is not supported by unison-watchdog, please disable this option (-links)")
-      when /^DONE$/
-        # Unison signals that it is done scanning the part of the replica
-        # described by the START process by emitting the 'DONE' command. The
-        # child process should not respond to this command.
-        break
+    case cmd
+    when /^VERSION ([0-9])/
+      # Unison and the child process starts by indicating the protocol
+      # version they support. At the moment, they should just output the
+      # line 'VERSION 1'.
+      if $1 == "#{UNISON_FSMONITOR_VERSION_NO}"
+        sendVersion(UNISON_FSMONITOR_VERSION_NO)
       else
-        unknownCommandError cmd
+        sendError "Unknown version: #{cmd}"
       end
+
+    when /^START ([^\s]+) ([^\s]+) ?([^\s]*)/ # 'START hash fspath [path]'
+      # When Unison start scanning a part of the replica, it emits command:
+      # 'START hash fspath path', thus indicating the archive hash (that
+      # uniquely determines the replica) the replica's fspath and the path
+      # where the scanning process starts. The child process should start
+      # monitoring this location, then acknowledge the command by sending an
+      # 'OK' response.
+      hash = $1
+      fspath = $2
+      path = $3
+      UnisonMonitor.start(hash, fspath, path)
+      sendOk
+
+      while cmd = readline do
+        case cmd
+        when /^DIR/ # 'DIR [path1]'
+          # When Unison starts scanning a directory, it emits the command
+          # 'DIR path1', where 'path1' is relative to the path given by the
+          # START command (the location of the directory can be obtained by
+          # concatenation of 'fspath', 'path', and 'path1'). The child process
+          # should then start monitoring the directory, before sending an 'OK'
+          # response.
+          sendOk
+
+        when /^LINK (.+)/ # 'LINK path1'
+          # When Unison encounters a followed link, it emits the command
+          # 'LINK path1'. The child process is expected to start monitoring
+          # the link target before replying by 'OK'.
+          sendError("link following is not supported by unison-watchdog, please disable this option (-links)")
+        when /^DONE$/
+          # Unison signals that it is done scanning the part of the replica
+          # described by the START process by emitting the 'DONE' command. The
+          # child process should not respond to this command.
+          break
+        else
+          unknownCommandError cmd
+        end
+      end
+
+    when /^CHANGES (.+)/ # 'CHANGES hash'
+      # Unison can ask for a list of paths containing changes in a given
+      # replica by sending the 'CHANGES hash' command. The child process
+      # responds by a sequence of 'RECURSIVE path' responses, followed by a
+      # 'DONE' response. These paths should be relative to the replica
+      # 'fspath'. The child process will not have to report this changes any
+      # more: it can consider that Unison has taken this information into
+      # account once and for all. Thus, it is expected to thereafter report
+      # only further changes.
+      hash = $1
+      UnisonMonitor.report_recursive(hash)
+      sendDone
+
+    when /^WAIT (.+)/ # 'WAIT hash'
+      # Unison can wait for changes in a replica by emitting a 'WAIT hash'
+      # command. It can watch several replicas by sending a serie of these
+      # commands. The child process is expected to respond once, by a
+      # 'CHANGE hash1 ... hash2' response that lists the changed replicas
+      # among those included in a 'WAIT' command, when changes are
+      # available. It should cancel pending waits when any other command is
+      # received.
+      hash = $1
+      UnisonMonitor.wait(hash)
+      if UnisonMonitor.changes?(hash)
+        UnisonMonitor.report_changes(hash)
+      end
+
+    when /^RESET (.+)/ # 'RESET hash'
+      # Finally, the command 'RESET hash' tells the child process to stop
+      # watching the given replica. In particular, it can discard any
+      # pending change information for this replica.
+      hash = $1
+      UnisonMonitor.reset(hash)
+
+    when /^DEBUG/
+      # Debugging is enabled by the 'DEBUG' command.
+      debug = true
+
+    else
+      unknownCommandError cmd
     end
-
-  when /^CHANGES (.+)/ # 'CHANGES hash'
-    # Unison can ask for a list of paths containing changes in a given
-    # replica by sending the 'CHANGES hash' command. The child process
-    # responds by a sequence of 'RECURSIVE path' responses, followed by a
-    # 'DONE' response. These paths should be relative to the replica
-    # 'fspath'. The child process will not have to report this changes any
-    # more: it can consider that Unison has taken this information into
-    # account once and for all. Thus, it is expected to thereafter report
-    # only further changes.
-    hash = $1
-    UnisonMonitor.report_recursive(hash)
-    sendDone
-
-  when /^WAIT (.+)/ # 'WAIT hash'
-    # Unison can wait for changes in a replica by emitting a 'WAIT hash'
-    # command. It can watch several replicas by sending a serie of these
-    # commands. The child process is expected to respond once, by a
-    # 'CHANGE hash1 ... hash2' response that lists the changed replicas
-    # among those included in a 'WAIT' command, when changes are
-    # available. It should cancel pending waits when any other command is
-    # received.
-    hash = $1
-    UnisonMonitor.wait(hash)
-    if UnisonMonitor.changes?(hash)
-      UnisonMonitor.report_changes(hash)
-    end
-
-  when /^RESET (.+)/ # 'RESET hash'
-    # Finally, the command 'RESET hash' tells the child process to stop
-    # watching the given replica. In particular, it can discard any
-    # pending change information for this replica.
-    hash = $1
-    UnisonMonitor.reset(hash)
-
-  when /^DEBUG/
-    # Debugging is enabled by the 'DEBUG' command.
-    debug = true
-
-  else
-    unknownCommandError cmd
   end
+rescue Interrupt => e
+  debug e.message
 end
